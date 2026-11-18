@@ -1,0 +1,109 @@
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+//neophodni UUIDevi za BLE, po NUS (Nordic UART Service) standardu, ne dirat
+#define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define RX_UUID             "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define TX_UUID             "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+//analog pin             odje ga menjaj
+#define ANALOG_INPUT_PIN 1  
+
+//ovo ostaviti, pocetna podesavanja za vrednosti
+BLEServer* pServer = nullptr;  
+BLECharacteristic* pTxCharacteristic = nullptr;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+
+// tajmer, moze da se menja interval koliki je izmedju batcheva podataka
+unsigned long zadnjeVremeMicros = 0;
+const long intervalMicros = 1000; 
+
+// Batch podešavanja (smanjeno na 8 da stane u standardni BLE paket / MTU opseg bez cepanja)
+const int BATCH_SIZE = 8;
+String stringBuffer = ""; // Ispravljeno sa "Batch 0" na prazan string
+int sampleCount = 0;
+
+class ServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) override { 
+        deviceConnected = true; 
+    }
+    void onDisconnect(BLEServer* pServer) override { 
+        deviceConnected = false; 
+        pServer->startAdvertising(); 
+    }
+};
+
+void setup() {
+    Serial.begin(115200);
+    
+    // Podešavanje ADC-a za ESP32-S3
+    analogReadResolution(12); // 0 - 4095
+    analogSetAttenuation(ADC_11db);
+    
+    BLEDevice::init("ELE-P EKG test BLE");//<-- ovde mozes promeniti ime
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallbacks()); //zove ovu nasu klasu
+    
+    BLEService *pService = pServer->createService(SERVICE_UUID);//UUID ne dirati
+    
+    // TX
+    pTxCharacteristic = pService->createCharacteristic(
+        TX_UUID, 
+        BLECharacteristic::PROPERTY_NOTIFY
+    );//mogucnost da notifikuje klijenta da bi on procitao podatak i sama stvar sto se salje
+    pTxCharacteristic->addDescriptor(new BLE2902());  //isto to al da aplikacija moze da prepozna
+    
+    // RX 
+    BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
+        RX_UUID, 
+        BLECharacteristic::PROPERTY_WRITE
+    );
+    //pokretanje samog serera
+    pService->start(); 
+    
+    //reklamiranje, tj vikanje "EEEEEEEE MOGU DA SE POVEZEM"
+    pServer->getAdvertising()->addServiceUUID(SERVICE_UUID); //opet UUID je po nekom nordijskom standardu i ne pipati  
+    pServer->getAdvertising()->start(); 
+}
+
+void loop() {
+    unsigned long trenutnoVremeMicros = micros();
+
+    //ako si povezan i razlika izmedju trenutnog vremena i proslog citanja je 1ms il vise(tu ne bi trebalo da upadne), proso je
+    if (deviceConnected && (trenutnoVremeMicros - zadnjeVremeMicros >= intervalMicros)) { 
+        zadnjeVremeMicros = trenutnoVremeMicros; //zadnje vreme kad smo citali je trenutno
+
+        int rawADC = analogRead(ANALOG_INPUT_PIN);   //citanje
+        
+        stringBuffer += String(rawADC) + ","; // hvala bogu za C++ string, samo dodajemo nas broj i zarez+" " za csv npr, moze i nesto drugo,    	string je moze da mu se radi sta oces
+        sampleCount++; //ocitali smo broj, povecaj broj brojeva za 1
+
+        // kad imamo 100 brojeva u nizu, procice i 100ms
+        if (sampleCount >= BATCH_SIZE) {
+            // menjamo poslednji zarez sa karakterom za novi red
+            if (stringBuffer.length() > 0) {
+                stringBuffer[stringBuffer.length() - 1] = '\n'; 
+            }
+            // SALJI MISO
+            pTxCharacteristic->setValue(stringBuffer.c_str());
+            pTxCharacteristic->notify();  
+            
+            //sve se vraca na default
+            stringBuffer = "";
+            sampleCount = 0;
+        }
+    }
+    
+    // Auto Reconnect logika
+    if (!deviceConnected && oldDeviceConnected) { //nismo povezani i old deviceconnected = tru
+        delay(500); // mala pauza pred ponovno reklamiranje
+        pServer->startAdvertising();          // reklamiraj se
+        oldDeviceConnected = deviceConnected; //old device dobije vrednost deviceconnected tj false
+    }
+    if (deviceConnected && !oldDeviceConnected) { //device je konektovan, ovde ce prvo uci, old device dobija vrednost devica tj true
+        oldDeviceConnected = deviceConnected;  
+    }
+}
